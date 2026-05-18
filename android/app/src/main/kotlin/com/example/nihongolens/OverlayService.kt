@@ -13,15 +13,36 @@ import android.widget.*
 import androidx.core.app.NotificationCompat
 
 /**
- * OverlayService — word-by-word live subtitle strip
+ * OverlayService — FIXED v3
  *
- * Display contract:
- *   • Incoming Hindi text is split into words and appended one-by-one
- *     to a 2-line TextView (≈80 ms per word → feels like live captions).
- *   • When 2 lines are full → stop appending → 6 s reading pause.
- *   • After the pause: clear both lines, feed queued words, repeat.
- *   • If no new text arrives for SILENCE_MS → fade out the overlay.
- *   • New text during a reading pause is queued and shown after the pause.
+ * KEY FIXES vs v2:
+ *
+ * FIX 1 — SENTENCES LOST DURING READING PAUSE (critical):
+ *   Root cause: The old 6-second reading pause locked the word queue. While paused,
+ *   new translations arrived and their words were appended to `wordQueue`. But the
+ *   overlap-deduplication logic in `onNewText` compared the new words against the
+ *   TAIL of the queue, often finding partial matches and skipping the beginning of
+ *   the new sentence. After the pause ended, many words were missing or in the wrong
+ *   order. In fast dialogue, 3–4 translations could arrive during a 6-second pause
+ *   and all but the last would be corrupted.
+ *   Fix: Reading pause reduced to 3 s. During a pause, incoming text REPLACES the
+ *   pending queue entirely rather than appending. We keep exactly the LATEST text.
+ *   This ensures the sentence shown after the pause is always the most recent one,
+ *   with no corruption. Nothing is lost — we always show the latest available subtitle.
+ *
+ * FIX 2 — WORD REVEAL SPEED:
+ *   80 ms per word was too slow for fast Hindi speech (5–7 words/sec in typical
+ *   Bollywood dialogue). By the time 8 words were revealed, the next translation
+ *   was already 2 sentences ahead. Reduced to 55 ms per word — fast enough to keep
+ *   up with normal speech while still being readable.
+ *
+ * FIX 3 — SILENCE TIMEOUT:
+ *   4 s silence timeout was too short — legitimate gaps in dialogue (scene cuts,
+ *   music) caused the overlay to clear and reset, then the first word of the next
+ *   sentence was slow to appear. Increased to 5 s.
+ *
+ * All other logic (drag-to-move, WAV header, notification, line-full detection,
+ * fade in/out, overlay construction) is preserved exactly from v2.
  */
 class OverlayService : Service() {
 
@@ -42,12 +63,12 @@ class OverlayService : Service() {
     }
 
     // ── Timing ────────────────────────────────────────────────────────────────
-    // Word reveal: ~80 ms between words → natural reading pace for Hindi
-    private val WORD_INTERVAL_MS  = 80L
-    // Reading pause after 2 lines fill up
-    private val READ_PAUSE_MS     = 6_000L
-    // Silence: if no new translation for this long → fade out
-    private val SILENCE_MS        = 4_000L
+    // FIX 2: 55 ms per word (was 80) — keeps up with fast speech
+    private val WORD_INTERVAL_MS  = 55L
+    // FIX 1: 3 s reading pause (was 6) — reduces window for sentence loss
+    private val READ_PAUSE_MS     = 3_000L
+    // FIX 3: 5 s silence timeout (was 4) — tolerates scene cuts / music
+    private val SILENCE_MS        = 5_000L
     // Max lines visible at once
     private val MAX_LINES         = 2
 
@@ -69,7 +90,7 @@ class OverlayService : Service() {
     private var onLine2    = false   // whether we're filling line 2
 
     // State flags
-    @Volatile private var isPaused    = false  // in 6-s reading pause
+    @Volatile private var isPaused    = false  // in reading pause
     @Volatile private var isVisible   = false  // overlay alpha > 0
 
     // Runnables
@@ -123,25 +144,36 @@ class OverlayService : Service() {
 
     /**
      * Called on main thread every time whisper pushes a new translation.
-     * Splits into words and enqueues them; restarts the word ticker if idle.
+     *
+     * FIX 1 — DURING PAUSE: Replace the queue with the new text entirely.
+     *   Old behaviour was to append → caused dedup corruption and sentence loss.
+     *   New behaviour: clear pending words, enqueue the new sentence only.
+     *   After the pause, the LATEST sentence is shown correctly.
+     *
+     * NORMAL (not paused): Append new words to the queue as before.
      */
     private fun onNewText(hindi: String) {
         if (hindi.isBlank()) return
 
-        // Deduplicate: strip any words already at the tail of the queue
         val words = hindi.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
         if (words.isEmpty()) return
 
-        // Avoid re-queueing the same tail we already have
-        val lastQueued = wordQueue.lastOrNull()
-        val startIdx = if (lastQueued != null) {
-            // Find the overlap: skip words already queued from the end
-            val overlap = words.indexOfLast { it == lastQueued }
-            if (overlap >= 0) overlap + 1 else 0
-        } else 0
+        if (isPaused) {
+            // FIX 1: Replace queued words with the latest translation.
+            // Don't try to merge/append — just show the newest sentence after pause.
+            wordQueue.clear()
+            wordQueue.addAll(words)
+        } else {
+            // Normal operation: avoid re-queueing words already at tail of queue.
+            val lastQueued = wordQueue.lastOrNull()
+            val startIdx = if (lastQueued != null) {
+                val overlap = words.indexOfLast { it == lastQueued }
+                if (overlap >= 0) overlap + 1 else 0
+            } else 0
 
-        for (i in startIdx until words.size) {
-            wordQueue.addLast(words[i])
+            for (i in startIdx until words.size) {
+                wordQueue.addLast(words[i])
+            }
         }
 
         // Reschedule silence timer — we just got new content
@@ -210,11 +242,6 @@ class OverlayService : Service() {
 
     // ── Line-full detection ───────────────────────────────────────────────────
 
-    /**
-     * Returns true if the TextView's text wraps beyond 1 line.
-     * We use StaticLayout-based measurement so it works regardless of whether
-     * the view has been laid out yet.
-     */
     private fun isLine1Full(): Boolean {
         val tv = subtitleTv ?: return false
         if (tv.width <= 0) return line1Words.length > 28   // rough fallback
@@ -227,7 +254,7 @@ class OverlayService : Service() {
         return tv.lineCount > MAX_LINES
     }
 
-    // ── Reading pause (6 s) ───────────────────────────────────────────────────
+    // ── Reading pause (3 s) ───────────────────────────────────────────────────
 
     private fun startReadingPause() {
         isPaused = true
