@@ -268,21 +268,14 @@ class SpeechCaptureService : Service() {
         mainHandler.post { OverlayService.updateText("", "") }
 
         captureThread = Thread({
-            // SLIDING WINDOW with 0.5s overlap
-            // Problem: 2s chunks cut randomly — words starting at 1.9s get split
-            // across two chunks. Whisper sees incomplete words → drops them.
-            // Fix: keep OVERLAP_BYTES (0.5s = 16000 samples × 2 bytes) from the
-            // end of each chunk and prepend to the next chunk.
-            // Each chunk sent = OVERLAP(0.5s) + NEW_AUDIO(2s) = 2.5s total.
-            // Whisper sees complete words at every boundary.
-            val OVERLAP_SAMPLES = (SAMPLE_RATE * 0.5).toInt()  // 8000 samples
-            val OVERLAP_BYTES   = OVERLAP_SAMPLES * 2           // 16000 bytes
-            val SEND_BYTES      = CHUNK_BYTES + OVERLAP_BYTES   // 2.5s total
-
-            val window   = ByteArray(SEND_BYTES)  // full send buffer
-            var filled   = OVERLAP_BYTES          // start after overlap region
-            val readBuf  = ByteArray(4096)
-            var firstChunk = true
+            // Clean 2s chunks — no overlap.
+            // Overlap was causing duplicate words: same 0.5s audio appeared
+            // in two consecutive chunks → CT2 translated same words twice.
+            // Words at exact chunk boundaries may occasionally be split but
+            // this is less harmful than the systematic duplicates from overlap.
+            val window  = ByteArray(CHUNK_BYTES)
+            var filled  = 0
+            val readBuf = ByteArray(4096)
 
             while (capturing.get() && !Thread.currentThread().isInterrupted) {
                 val rec  = audioRecord ?: break
@@ -293,29 +286,18 @@ class SpeechCaptureService : Service() {
 
                 var src = 0
                 while (src < read) {
-                    val toCopy = minOf(read - src, SEND_BYTES - filled)
+                    val toCopy = minOf(read - src, CHUNK_BYTES - filled)
                     System.arraycopy(readBuf, src, window, filled, toCopy)
                     filled += toCopy; src += toCopy
 
-                    if (filled >= SEND_BYTES) {
+                    if (filled >= CHUNK_BYTES) {
                         if (!reconnecting) {
-                            if (firstChunk) {
-                                // First chunk has no overlap — send without prepend
-                                val wav = pcmToWav(window.copyOfRange(OVERLAP_BYTES, SEND_BYTES))
-                                firstChunk = false
-                                val job = AudioJob(wav, System.currentTimeMillis())
-                                if (!audioQueue.offer(job)) { audioQueue.poll(); audioQueue.offer(job) }
-                            } else {
-                                // Send full window including overlap from previous chunk
-                                val wav = pcmToWav(window.copyOf(SEND_BYTES))
-                                val job = AudioJob(wav, System.currentTimeMillis())
-                                if (!audioQueue.offer(job)) { audioQueue.poll(); audioQueue.offer(job) }
-                            }
+                            val wav = pcmToWav(window.copyOf(CHUNK_BYTES))
+                            val job = AudioJob(wav, System.currentTimeMillis())
+                            if (!audioQueue.offer(job)) { audioQueue.poll(); audioQueue.offer(job) }
                             chunksSentThisSession.incrementAndGet()
                         }
-                        // Keep last OVERLAP_BYTES for next chunk
-                        System.arraycopy(window, SEND_BYTES - OVERLAP_BYTES, window, 0, OVERLAP_BYTES)
-                        filled = OVERLAP_BYTES
+                        filled = 0
                     }
                 }
             }
