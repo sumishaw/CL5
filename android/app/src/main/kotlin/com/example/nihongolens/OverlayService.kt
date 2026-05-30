@@ -44,7 +44,13 @@ class OverlayService : Service() {
     // Max lines before page-flip clear
     private val MAX_LINES   = 2
     // Clear everything after this silence
-    private val SILENCE_MS  = 5_000L
+    private val SILENCE_MS  = 8_000L
+
+    // Internal display queue — translated Hindi sentences waiting to be shown.
+    // Filled by updateText(), drained one sentence at a time by the display loop.
+    // This is what makes FIFO work: each 2-line block stays on screen until
+    // the display loop pops the next sentence from this queue.
+    private val displayQueue = ArrayDeque<String>()
 
     private var windowManager:  WindowManager?               = null
     private var overlayView:    View?                        = null
@@ -103,26 +109,49 @@ class OverlayService : Service() {
         if (hindi == lastHindi) return
         lastHindi = hindi
 
-        // Split incoming Hindi into individual sentences for clean display
+        // Split into sentences and add ALL to the display queue — never drop
         val incoming = splitHindi(hindi.trim())
-
         for (sentence in incoming) {
-            if (sentence.isBlank()) continue
-
-            if (lines.size >= MAX_LINES) {
-                // Page-flip: 2 lines full → clear and start fresh
-                clearWithFade {
-                    lines.clear()
-                    lines.add(sentence)
-                    renderLines(animate = true)
-                }
-            } else {
-                lines.add(sentence)
-                renderLines(animate = true)
-            }
+            if (sentence.isNotBlank()) displayQueue.addLast(sentence)
         }
 
+        // If nothing is currently displayed, start showing immediately
+        if (lines.isEmpty()) showNextFromQueue()
+
         rescheduleSilence()
+    }
+
+    // Pull the next sentence from displayQueue and show it.
+    // When 2 lines are full → page-flip: clear, then show the new sentence.
+    // The current 2-line block stays visible until this is called with new content.
+    private fun showNextFromQueue() {
+        if (displayQueue.isEmpty()) return
+        val sentence = displayQueue.removeFirst()
+
+        if (lines.size >= MAX_LINES) {
+            // Current block is full — fade it out, then show next sentence
+            clearWithFade {
+                lines.clear()
+                lines.add(sentence)
+                renderLines(animate = true)
+                // If more sentences are waiting, schedule showing the second one
+                scheduleNextLine()
+            }
+        } else {
+            lines.add(sentence)
+            renderLines(animate = true)
+            scheduleNextLine()
+        }
+    }
+
+    // Schedule pulling the next queued sentence.
+    // Give each line a minimum display time so it's readable (700ms).
+    // If more are queued, pull immediately after min display time.
+    private fun scheduleNextLine() {
+        if (displayQueue.isEmpty()) return
+        mainHandler.postDelayed({
+            if (running) showNextFromQueue()
+        }, 700L)
     }
 
     // ── Render ────────────────────────────────────────────────────────────────
@@ -199,6 +228,7 @@ class OverlayService : Service() {
         silenceRunnable = Runnable {
             clearWithFade {
                 lines.clear()
+                displayQueue.clear()
                 lastHindi = ""
             }
         }
