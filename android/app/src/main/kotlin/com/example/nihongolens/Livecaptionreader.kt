@@ -57,7 +57,11 @@ class LiveCaptionReader : AccessibilityService() {
     private var watchdogJob:  Job? = null
 
     // FIFO — unbounded, never drops
-    private val translateQueue = LinkedBlockingQueue<String>()
+    // Each item carries a sequence token so worker can detect items
+    // enqueued before a queue-clear (stale after LC window disappeared)
+    private val translateQueue   = LinkedBlockingQueue<Pair<Long, String>>()
+    private val seqCounter       = AtomicLong(0)
+    private var expectedSeq      = 0L   // items with seq < expectedSeq are stale
 
     // Dedup
     private var lastEnqueuedNorm = ""
@@ -202,7 +206,16 @@ class LiveCaptionReader : AccessibilityService() {
                 captionWasVisible  = false
                 lastRawCaption     = ""
                 lastSentText2      = ""
-                CaptionLogger.log(TAG, "LC gone → reset")
+                // Discard stale backlog — don't translate sentences from a video
+                // that already stopped playing
+                val dropped = translateQueue.size
+                translateQueue.clear()
+                expectedSeq = seqCounter.get() + 1   // skip any in-flight items
+                pendingJob?.cancel(); pendingJob = null
+                forceJob?.cancel();   forceJob   = null
+                if (dropped > 0) CaptionLogger.log(TAG, "LC gone → dropped $dropped (expectedSeq=$expectedSeq)")
+                else CaptionLogger.log(TAG, "LC gone → reset")
+                OverlayService.clearQueue()
             }
             return null
         }
@@ -268,11 +281,12 @@ class LiveCaptionReader : AccessibilityService() {
                     lastConfirmedLang = script
                     pendingLang       = ""
                     pendingLangCount  = 0
-                    // Only clear dedup, NOT the translateQueue — in-flight translations still valid
-                    lastSentText     = ""
-                    lastEnqueuedNorm = ""
-                    lastRawCaption   = ""
-                    lastSentText2    = ""
+                    lastSentText      = ""
+                    lastEnqueuedNorm  = ""
+                    lastRawCaption    = ""
+                    lastSentText2     = ""
+                    translateQueue.clear()
+                    expectedSeq = seqCounter.get() + 1
                 }
             } else {
                 pendingLang      = script
@@ -307,9 +321,10 @@ class LiveCaptionReader : AccessibilityService() {
         }
         lastEnqueuedNorm = norm
         lastSentText     = text
-        translateQueue.offer(text)
+        val seq = seqCounter.incrementAndGet()
+        translateQueue.offer(Pair(seq, text))
         enqueued.incrementAndGet()
-        CaptionLogger.log(TAG, "ENQ #${enqueued.get()} q=${translateQueue.size} '${text.take(60)}'")
+        CaptionLogger.log(TAG, "ENQ seq=$seq q=${translateQueue.size} '${text.take(60)}'")
     }
 
     // ── Translation worker ────────────────────────────────────────────────────
@@ -317,25 +332,38 @@ class LiveCaptionReader : AccessibilityService() {
     private fun startTranslateWorker() {
         translateJob = scope.launch {
             while (isActive) {
-                val text = withContext(Dispatchers.IO) {
+                val item = withContext(Dispatchers.IO) {
                     try { translateQueue.poll(2, java.util.concurrent.TimeUnit.SECONDS) }
                     catch (_: InterruptedException) { null }
                 } ?: continue
+
+                val (seq, text) = item
+
+                // Skip stale items (enqueued before LC window disappeared)
+                if (seq < expectedSeq) {
+                    CaptionLogger.log(TAG, "SKIP stale seq=$seq (expected>=$expectedSeq)")
+                    continue
+                }
 
                 val t0    = System.currentTimeMillis()
                 val hindi = translate(text)
                 val ms    = System.currentTimeMillis() - t0
 
+                // Check again after translation (LC may have disappeared during CT2 call)
+                if (seq < expectedSeq) {
+                    CaptionLogger.log(TAG, "DISCARD post-translate stale seq=$seq")
+                    continue
+                }
+
                 if (hindi.isNullOrBlank()) {
                     translateErrors.incrementAndGet()
-                    CaptionLogger.log(TAG, "ERR ${ms}ms '${text.take(40)}'")
-                    // Clear dedup so this text can retry if LC shows it again
+                    CaptionLogger.log(TAG, "ERR ${ms}ms seq=$seq '${text.take(40)}'")
                     if (normalize(text) == lastEnqueuedNorm) lastEnqueuedNorm = ""
                     continue
                 }
 
                 translated.incrementAndGet()
-                CaptionLogger.log(TAG, "OK #${translated.get()} ${ms}ms → '${hindi.take(40)}'")
+                CaptionLogger.log(TAG, "OK seq=$seq ${ms}ms → '${hindi.take(40)}'")
                 SpeechCaptureService.latestHindi   = hindi
                 SpeechCaptureService.latestEnglish = text
                 withContext(Dispatchers.Main) {
@@ -374,6 +402,7 @@ class LiveCaptionReader : AccessibilityService() {
         lastSentText      = ""; lastEnqueuedNorm  = ""
         lastConfirmedLang = ""; pendingLang        = ""; pendingLangCount = 0
         lastRawCaption    = ""; lastSentText2      = ""; captionWasVisible = false
+        expectedSeq       = 0L
         SpeechCaptureService.latestHindi    = ""
         SpeechCaptureService.latestEnglish  = ""
         SpeechCaptureService.latestOriginal = ""
