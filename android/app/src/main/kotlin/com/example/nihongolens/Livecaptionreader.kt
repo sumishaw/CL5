@@ -317,12 +317,39 @@ class LiveCaptionReader : AccessibilityService() {
         forceJob?.cancel(); forceJob = null
         if (text.isBlank()) return
         val norm = normalize(text)
-        if (norm == lastEnqueuedNorm) {
-            CaptionLogger.log(TAG, "SKIP dup '${text.take(50)}'"); return
+
+        // Compare the last 80 chars (meaningful tail) not the full accumulated LC text.
+        // LC appends words continuously — full text grows by 1-2 chars each event,
+        // producing hundreds of near-identical enqueues and a massive queue backlog.
+        val tail = if (norm.length > 80) norm.takeLast(80) else norm
+        val lastTail = if (lastEnqueuedNorm.length > 80) lastEnqueuedNorm.takeLast(80)
+                       else lastEnqueuedNorm
+
+        if (tail == lastTail) {
+            CaptionLogger.log(TAG, "SKIP tail-dup '${text.take(50)}'"); return
         }
+
+        // Also skip if new text is only marginally longer than last (< 10 new chars)
+        // — not enough new content to justify a fresh CT2 call
+        if (lastEnqueuedNorm.isNotEmpty() &&
+            norm.length > lastEnqueuedNorm.length &&
+            norm.length - lastEnqueuedNorm.length < 10 &&
+            norm.startsWith(lastEnqueuedNorm.take(lastEnqueuedNorm.length.coerceAtMost(norm.length - 5)))) {
+            CaptionLogger.log(TAG, "SKIP minor-ext +${norm.length - lastEnqueuedNorm.length}ch"); return
+        }
+
         lastEnqueuedNorm = norm
         lastSentText     = text
         val seq = seqCounter.incrementAndGet()
+
+        // Cap queue at 5 items. If backlogged, drop the oldest (head) to keep
+        // translations relevant to current speech. FIFO order preserved for remaining items.
+        while (translateQueue.size >= 5) {
+            val dropped = translateQueue.poll()
+            if (dropped != null)
+                CaptionLogger.log(TAG, "CAP: dropped oldest seq=${dropped.first}")
+        }
+
         translateQueue.offer(Pair(seq, text))
         enqueued.incrementAndGet()
         CaptionLogger.log(TAG, "ENQ seq=$seq q=${translateQueue.size} '${text.take(60)}'")
