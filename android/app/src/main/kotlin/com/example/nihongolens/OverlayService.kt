@@ -105,6 +105,12 @@ class OverlayService : Service() {
         super.onDestroy()
     }
 
+    private val MIN_READ_MS  = 3_000L   // minimum time each subtitle stays visible
+    private val READ_MS_BACKLOG = 2_000L
+    private val SILENCE_MS   = 8_000L
+
+    private var lastDisplayTime = 0L    // when current subtitle was shown
+
     // ── Queue ─────────────────────────────────────────────────────────────────
 
     private fun onPush(hindi: String) {
@@ -113,12 +119,27 @@ class OverlayService : Service() {
         if (t == currentText && queue.isEmpty()) { reschedSilence(); return }
 
         val token = tokenCounter.incrementAndGet()
-        queue.addLast(Item(token, t))   // FIFO
+        queue.addLast(Item(token, t))
         reschedSilence()
 
-        // Always advance immediately when new content arrives —
-        // mirrors UI subtitle which updates on every new translation
-        advance()
+        val elapsed = System.currentTimeMillis() - lastDisplayTime
+        if (!showing || elapsed >= MIN_READ_MS) {
+            // Idle or current subtitle has been shown long enough — replace immediately
+            advance()
+        } else {
+            // Current subtitle needs more reading time — schedule advance after remainder
+            val remaining = MIN_READ_MS - elapsed
+            if (readRunnable == null) {
+                val cap = tokenCounter.get()
+                readRunnable = Runnable {
+                    readRunnable = null
+                    if (!running) return@Runnable
+                    if (cap < expectedToken) { showing = false; return@Runnable }
+                    advance()
+                }
+                handler.postDelayed(readRunnable!!, remaining)
+            }
+        }
     }
 
     private fun onClear() {
@@ -126,6 +147,7 @@ class OverlayService : Service() {
         queue.clear()
         cancelTimer()
         showing = false
+        lastDisplayTime = 0L
     }
 
     // ── Display loop ──────────────────────────────────────────────────────────
@@ -133,26 +155,20 @@ class OverlayService : Service() {
     private fun advance() {
         cancelTimer()
 
-        // Drain stale items
         while (queue.isNotEmpty() && queue.first().token < expectedToken)
             queue.removeFirst()
 
-        if (queue.isEmpty()) {
-            // Nothing new — if already showing something, keep it visible
-            // until silence timer clears it. Don't reset showing here.
-            return
-        }
+        if (queue.isEmpty()) return   // nothing new — keep current visible
 
         val item = queue.removeFirst()
         if (item.token < expectedToken) { showing = false; return }
 
-        currentText = item.text
-        showing     = true
+        currentText     = item.text
+        showing         = true
+        lastDisplayTime = System.currentTimeMillis()
         display(item.text)
 
-        // Only schedule a timer if MORE items are still queued —
-        // advances through backlog at READ_MS_BACKLOG pace.
-        // If this is the last item, no timer — silence timer will clear it.
+        // If more items queued, schedule next advance after MIN_READ_MS
         if (queue.isNotEmpty()) {
             val cap = item.token
             readRunnable = Runnable {
@@ -163,6 +179,7 @@ class OverlayService : Service() {
             }
             handler.postDelayed(readRunnable!!, READ_MS_BACKLOG)
         }
+        // If nothing queued — stays visible until silence timer or next onPush
     }
 
     private fun cancelTimer() {
