@@ -41,7 +41,7 @@ class OverlayService : Service() {
     }
 
     // Timing — holdMsVar is user-controllable via Settings slider
-    private var holdMsVar        = 3_500L
+    @Volatile private var holdMsVar = 3_500L
 
     // ── Timing ────────────────────────────────────────────────────────────────
     // Words appear instantly (0ms gap) — fills 2 lines fast matching speech pace
@@ -98,7 +98,19 @@ class OverlayService : Service() {
         handler.post { if (running) buildOverlay() }
         pushCallback  = { _, hindi -> handler.post { onPush(hindi) } }
         clearCallback = { handler.post { onClear() } }
-        holdCallback  = { ms -> handler.post { holdMsVar = ms.coerceIn(1000, 15000) } }
+        holdCallback  = { ms ->
+            val clamped = ms.coerceIn(1000, 15000)
+            handler.post {
+                holdMsVar = clamped
+                // If a hold timer is currently pending, cancel and reschedule
+                // with the new value so change takes effect immediately
+                val pending = holdRunnable
+                if (pending != null) {
+                    handler.removeCallbacks(pending)
+                    handler.postDelayed(pending, holdMsVar)
+                }
+            }
+        }
     }
 
     override fun onStartCommand(i: Intent?, f: Int, s: Int) = START_STICKY
