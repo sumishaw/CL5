@@ -195,8 +195,6 @@ object HindiTtsService {
 
     fun setSpeedMultiplier(m: Float) { ttsSpeedMultiplier = m.coerceIn(0.5f, 4.0f) }
 
-    fun isSuppressed() = isSpeaking
-
     fun destroy() {
         genderJob?.cancel()
         tts?.stop(); tts?.shutdown(); tts = null
