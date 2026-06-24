@@ -31,9 +31,9 @@ object GenderAnalyzer {
     private const val WIN  = 2048        // YIN window — 128ms at 16kHz
     private const val TAU_MIN = (SR / 300.0).toInt()   // 300 Hz upper limit  = 53 samples
     private const val TAU_MAX = (SR / 60.0).toInt()    // 60 Hz  lower limit  = 266 samples
-    private const val YIN_THRESHOLD = 0.20f             // 0.20 handles PA/compressed audio better
+    private const val YIN_THRESHOLD = 0.35f             // 0.35 — lenient for PA/compressed/BBC audio
     private const val HIST = 3           // vote history — switch on 2/3 majority
-    private const val RMS_FLOOR = 200f   // skip very quiet frames (silence / noise)
+    private const val RMS_FLOOR = 50f    // low floor — broadcast audio via playback capture is quieter
 
     @Volatile var enabled = false
 
@@ -65,7 +65,13 @@ object GenderAnalyzer {
      * bytes: raw PCM 16-bit LE mono. count: valid byte count.
      * Runs on AudioCaptureThread — no I/O, no blocking.
      */
+    private var feedCount = 0
+
     fun feedPcm(bytes: ByteArray, count: Int) {
+        feedCount++
+        if (feedCount % 100 == 0) {
+            CaptionLogger.log(TAG, "feedPcm #$feedCount enabled=$enabled accumFill=$accumFill")
+        }
         if (!enabled) return
         // NOTE: isSuppressed() check removed — TTS uses USAGE_ASSISTANT which is
         // physically excluded from AudioPlaybackCaptureConfiguration (USAGE_MEDIA only).
@@ -88,12 +94,18 @@ object GenderAnalyzer {
 
     // ── YIN pitch detection ───────────────────────────────────────────────────
 
+    private var analyzeCount = 0
+
     private fun analyze() {
+        analyzeCount++
         // RMS check — skip silence and near-silence
         var energy = 0.0
         for (s in accum) energy += s.toLong() * s
         val rms = sqrt(energy / WIN).toFloat()
-        if (rms < RMS_FLOOR) return
+        if (rms < RMS_FLOOR) {
+            if (analyzeCount % 20 == 0) CaptionLogger.log(TAG, "analyze #$analyzeCount rms=${rms.toInt()} SILENT floor=$RMS_FLOOR")
+            return
+        }
 
         // Normalize to float [-1, 1]
         val x = FloatArray(WIN) { accum[it] / 32768f }
@@ -133,13 +145,19 @@ object GenderAnalyzer {
             }
             tau++
         }
-        // No confident pitch found — frame is unvoiced (noise/silence/music)
-        // Don't vote — let history hold its current state
+        // No confident pitch found — frame is unvoiced
+        var minVal = 1f; var minTau = TAU_MIN
+        for (t in TAU_MIN until TAU_MAX) { if (cmndf[t] < minVal) { minVal = cmndf[t]; minTau = t } }
+        if (analyzeCount % 10 == 0) {
+            val f0est = SR.toFloat() / minTau
+            CaptionLogger.log(TAG, "noPitch #$analyzeCount rms=${rms.toInt()} minCMNDF=${String.format("%.3f", minVal)} f0est=${f0est.toInt()}Hz thr=$YIN_THRESHOLD")
+        }
     }
 
     private var frameCount = 0
 
     private fun classifyPitch(f0: Float, rms: Float) {
+        if (frameCount % 5 == 0) CaptionLogger.log(TAG, "PITCH F0=${f0.toInt()}Hz rms=${rms.toInt()} → ${if (f0 >= 165f) "FEMALE" else "MALE"}")
         // Hard boundary at 165 Hz (standard male/female divide)
         val gender = if (f0 >= 165f) HindiTtsService.Gender.FEMALE
                      else             HindiTtsService.Gender.MALE
