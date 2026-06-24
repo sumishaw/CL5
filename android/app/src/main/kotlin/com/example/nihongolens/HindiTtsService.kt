@@ -95,7 +95,7 @@ object HindiTtsService {
         enabled = on
         if (!on) {
             fetchQueue.clear(); playQueue.clear()
-            stopAudio(); releaseAudioFocus()
+            stopAudio()
             spokenTokens.clear()
         }
     }
@@ -108,7 +108,7 @@ object HindiTtsService {
 
     fun stopAndClear() {
         fetchQueue.clear(); playQueue.clear()
-        stopAudio(); releaseAudioFocus()
+        stopAudio()
         isSpeaking = false
         speakingUntilMs = System.currentTimeMillis() + 2_000L
         spokenTokens.clear()
@@ -118,7 +118,7 @@ object HindiTtsService {
     fun destroy() {
         genderJob?.cancel(); fetchWorker?.cancel(); playWorker?.cancel()
         fetchQueue.clear(); playQueue.clear()
-        stopAudio(); releaseAudioFocus()
+        stopAudio()
         scope.cancel()
     }
 
@@ -175,21 +175,18 @@ object HindiTtsService {
                 if (!enabled) continue
                 try {
                     isSpeaking = true
-                    requestAudioFocus()
-                    // Show subtitle exactly when TTS starts speaking
+                    // No audio focus request — USAGE_ASSISTANT handles exclusion from LC
+                    // AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE was pausing video → LC gap → loop
                     withContext(Dispatchers.Main) {
                         OverlayService.showTtsText(item.text)
                     }
                     playWav(item.wav, item.durMs)
-                    // Clear subtitle when TTS finishes
                     withContext(Dispatchers.Main) {
                         OverlayService.clearTtsText()
                     }
-                    releaseAudioFocus()
                     speakingUntilMs = System.currentTimeMillis() + 800L
                 } catch (e: Exception) {
                     Log.e(TAG, "Play: ${e.message}")
-                    releaseAudioFocus()
                 } finally {
                     isSpeaking = false
                 }
@@ -327,7 +324,10 @@ object HindiTtsService {
                 r.release()
             } catch (_: Exception) {}
         }
-        val record = rec ?: return@withContext
+        val record = rec ?: run {
+            Log.e(TAG, "Gender: no AudioRecord available")
+            return@withContext
+        }
 
         val buf = ShortArray(SAMPLES)
         try {
@@ -343,13 +343,14 @@ object HindiTtsService {
             try { record.release() } catch (_: Exception) {}
         }
 
-        if (isSuppressed()) return@withContext  // check again after recording
+        if (isSuppressed()) return@withContext
 
-        // RMS check
+        // RMS check — very low threshold for mic picking up tablet speakers
         var sq = 0.0
         for (i in buf.indices) sq += buf[i].toLong() * buf[i]
         val rms = kotlin.math.sqrt(sq / buf.size)
-        if (rms < 20) return@withContext  // silence
+        Log.d(TAG, "Gender sample rms=${rms.toInt()}")  // always log for diagnosis
+        if (rms < 10) { Log.d(TAG, "Gender: silence skip"); return@withContext }
 
         // Convert to bytes and POST to whisper_server for FFT analysis
         val pcm = ByteArray(buf.size * 2)
