@@ -31,8 +31,8 @@ object GenderAnalyzer {
     private const val WIN  = 2048        // YIN window — 128ms at 16kHz
     private const val TAU_MIN = (SR / 300.0).toInt()   // 300 Hz upper limit  = 53 samples
     private const val TAU_MAX = (SR / 60.0).toInt()    // 60 Hz  lower limit  = 266 samples
-    private const val YIN_THRESHOLD = 0.15f             // lower = stricter pitch confidence
-    private const val HIST = 5           // vote history — switch on 3/5 majority
+    private const val YIN_THRESHOLD = 0.20f             // 0.20 handles PA/compressed audio better
+    private const val HIST = 3           // vote history — switch on 2/3 majority
     private const val RMS_FLOOR = 200f   // skip very quiet frames (silence / noise)
 
     @Volatile var enabled = false
@@ -67,7 +67,9 @@ object GenderAnalyzer {
      */
     fun feedPcm(bytes: ByteArray, count: Int) {
         if (!enabled) return
-        if (HindiTtsService.isSuppressed()) { accumFill = 0; return }
+        // NOTE: isSuppressed() check removed — TTS uses USAGE_ASSISTANT which is
+        // physically excluded from AudioPlaybackCaptureConfiguration (USAGE_MEDIA only).
+        // Our Hindi TTS is never present in this audio stream, so no suppression needed.
 
         var i = 0
         while (i + 1 < count) {
@@ -135,6 +137,8 @@ object GenderAnalyzer {
         // Don't vote — let history hold its current state
     }
 
+    private var frameCount = 0
+
     private fun classifyPitch(f0: Float, rms: Float) {
         // Hard boundary at 165 Hz (standard male/female divide)
         val gender = if (f0 >= 165f) HindiTtsService.Gender.FEMALE
@@ -143,7 +147,13 @@ object GenderAnalyzer {
         history.addLast(gender)
         if (history.size > HIST) history.removeFirst()
 
-        // Need 3/5 majority to switch — avoids flip-flopping on ambiguous frames
+        // Diagnostic log every 8 voiced frames so we can see F0 values in logcat
+        frameCount++
+        if (frameCount % 8 == 0) {
+            Log.d(TAG, "YIN F0=${f0.toInt()}Hz rms=${rms.toInt()} → $gender hist=${history.size} cur=${HindiTtsService.detectedGender}")
+        }
+
+        // Need 2/3 majority to switch
         val fCount   = history.count { it == HindiTtsService.Gender.FEMALE }
         val majority = if (fCount > history.size / 2) HindiTtsService.Gender.FEMALE
                        else HindiTtsService.Gender.MALE
