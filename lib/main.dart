@@ -66,6 +66,17 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   Timer?  _pollTimer;
   String  _lastSeenHindi   = '';
 
+  // ── Log tab state ─────────────────────────────────────────────────────────
+  final List<String> _logLines     = [];
+  final ScrollController _logScroll = ScrollController();
+  Timer?  _logTimer;
+  int     _logTab           = 0;   // 0=main, 1=log
+  String  _genderDetected   = 'male';
+  String  _genderSelected   = 'auto';
+  bool    _genderAnalyzerOn = false;
+  int     _skippedCount     = 0;
+  int     _translatedCount  = 0;
+
   ModelState  modelState    = ModelState.checking;
   String      modelErrorMsg = '';
 
@@ -104,6 +115,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
     _checkPermissions();
     _checkModelStatus();
+    _startLogPolling();
   }
 
   @override
@@ -237,9 +249,52 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   @override
+  // ── Log polling ──────────────────────────────────────────────────────────
+
+  void _startLogPolling() {
+    _logTimer?.cancel();
+    _logTimer = Timer.periodic(const Duration(seconds: 2), (_) async {
+      if (!mounted) return;
+      try {
+        final raw = await _ch.invokeMethod<String>('getLogs', 200);
+        if (raw == null || !mounted) return;
+        final lines = raw.split('\n').where((l) => l.trim().isNotEmpty).toList();
+        // Count skipped/translated from logs
+        int skip = 0, trans = 0;
+        for (final l in lines) {
+          if (l.contains('SKIP')) skip++;
+          if (l.contains('[tts]') || l.contains('OK ')) trans++;
+        }
+        final gst = await _ch.invokeMethod<Map>('getGenderStatus');
+        if (!mounted) return;
+        setState(() {
+          _logLines
+            ..clear()
+            ..addAll(lines.length > 150 ? lines.sublist(lines.length - 150) : lines);
+          _skippedCount  = skip;
+          _translatedCount = trans;
+          if (gst != null) {
+            _genderDetected   = gst['detected']?.toString()  ?? 'male';
+            _genderSelected   = gst['selected']?.toString()  ?? 'auto';
+            _genderAnalyzerOn = gst['enabled'] as bool? ?? false;
+          }
+        });
+        if (_logTab == 1 && _logScroll.hasClients) {
+          _logScroll.animateTo(
+            _logScroll.position.maxScrollExtent,
+            duration: const Duration(milliseconds: 200),
+            curve: Curves.easeOut,
+          );
+        }
+      } catch (_) {}
+    });
+  }
+
   void dispose() {
     _pulseTimer?.cancel();
     _pollTimer?.cancel();
+    _logTimer?.cancel();
+    _logScroll.dispose();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
@@ -248,59 +303,179 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: Colors.black,
-      body: SafeArea(
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.all(20),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
+    return DefaultTabController(
+      length: 2,
+      child: Scaffold(
+        backgroundColor: Colors.black,
+        appBar: PreferredSize(
+          preferredSize: const Size.fromHeight(48),
+          child: TabBar(
+            onTap: (i) => setState(() => _logTab = i),
+            labelColor: Colors.redAccent,
+            unselectedLabelColor: Colors.white38,
+            indicatorColor: Colors.redAccent,
+            tabs: [
+              const Tab(text: 'CAPTIONS'),
+              Tab(text: 'LOGS  ${_logLines.isNotEmpty ? "(${_logLines.length})" : ""}'),
+            ],
+          ),
+        ),
+        body: SafeArea(
+          child: TabBarView(
+            physics: const NeverScrollableScrollPhysics(),
             children: [
-              _buildHeader(),
-              const SizedBox(height: 16),
-              _buildInfoBanner(),
-              const SizedBox(height: 16),
-              _buildModelCard(),
-              const SizedBox(height: 12),
-              _buildOverlayPermRow(),
-              const SizedBox(height: 12),
-              _buildAccessibilityRow(),
-              const SizedBox(height: 16),
-              _buildModeSelector(),
-              const SizedBox(height: 16),
-              _buildLanguageChips(),
-              const SizedBox(height: 16),
-              _buildLangSelector(),
-              _buildSubtitleSpeedSlider(),
-              _buildTtsControls(),
-              const SizedBox(height: 16),
-              if (originalText.isNotEmpty) ...[
-                _buildDetectedText(),
-                const SizedBox(height: 10),
-              ],
-              if (displayText.isNotEmpty)
-                _buildTranslationOutput(),
-              if (statusMsg.isNotEmpty) ...[
-                const SizedBox(height: 12),
-                _buildStatusBanner(),
-              ],
-              const SizedBox(height: 20),
-              _buildStartStopButton(),
-              const SizedBox(height: 8),
-              Center(
-                child: Text(
-                  captionMode == CaptionMode.liveCaptions
-                      ? 'Using Android Live Captions — no audio captured by this app'
-                      : 'Captures internal phone audio — microphone stays off',
-                  style: const TextStyle(color: Colors.white24, fontSize: 11),
-                  textAlign: TextAlign.center,
+              // ── Tab 0: Main captions UI ─────────────────────────────────
+              SingleChildScrollView(
+                padding: const EdgeInsets.all(20),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    _buildHeader(),
+                    const SizedBox(height: 16),
+                    _buildInfoBanner(),
+                    const SizedBox(height: 16),
+                    _buildModelCard(),
+                    const SizedBox(height: 12),
+                    _buildOverlayPermRow(),
+                    const SizedBox(height: 12),
+                    _buildAccessibilityRow(),
+                    const SizedBox(height: 16),
+                    _buildModeSelector(),
+                    const SizedBox(height: 16),
+                    _buildLanguageChips(),
+                    const SizedBox(height: 16),
+                    _buildLangSelector(),
+                    _buildSubtitleSpeedSlider(),
+                    _buildTtsControls(),
+                    const SizedBox(height: 16),
+                    if (originalText.isNotEmpty) ...[
+                      _buildDetectedText(),
+                      const SizedBox(height: 10),
+                    ],
+                    if (displayText.isNotEmpty)
+                      _buildTranslationOutput(),
+                    if (statusMsg.isNotEmpty) ...[
+                      const SizedBox(height: 12),
+                      _buildStatusBanner(),
+                    ],
+                    const SizedBox(height: 20),
+                    _buildStartStopButton(),
+                    const SizedBox(height: 8),
+                    Center(
+                      child: Text(
+                        captionMode == CaptionMode.liveCaptions
+                            ? 'Using Android Live Captions — no audio captured by this app'
+                            : 'Captures internal phone audio — microphone stays off',
+                        style: const TextStyle(color: Colors.white24, fontSize: 11),
+                        textAlign: TextAlign.center,
+                      ),
+                    ),
+                    const SizedBox(height: 20),
+                  ],
                 ),
               ),
-              const SizedBox(height: 20),
+              // ── Tab 1: Log viewer ────────────────────────────────────────
+              _buildLogTab(),
             ],
           ),
         ),
       ),
+    );
+  }
+
+  // ── Log tab ───────────────────────────────────────────────────────────────
+
+  Widget _buildLogTab() {
+    final femaleColor = Colors.pinkAccent;
+    final maleColor   = Colors.lightBlueAccent;
+    final gColor      = _genderDetected == 'female' ? femaleColor : maleColor;
+
+    return Column(
+      children: [
+        // Status bar
+        Container(
+          color: Colors.white.withOpacity(0.05),
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          child: Row(children: [
+            // Gender status
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+              decoration: BoxDecoration(
+                color: gColor.withOpacity(0.15),
+                borderRadius: BorderRadius.circular(4),
+                border: Border.all(color: gColor.withOpacity(0.5)),
+              ),
+              child: Row(mainAxisSize: MainAxisSize.min, children: [
+                Icon(Icons.mic, size: 13, color: gColor),
+                const SizedBox(width: 4),
+                Text(
+                  'Voice: ${_genderDetected.toUpperCase()}  (${_genderSelected == "auto" ? "AUTO" : _genderSelected.toUpperCase()})',
+                  style: TextStyle(color: gColor, fontSize: 11, fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(width: 6),
+                Container(
+                  width: 7, height: 7,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: _genderAnalyzerOn ? Colors.greenAccent : Colors.redAccent,
+                  ),
+                ),
+              ]),
+            ),
+            const SizedBox(width: 8),
+            // Translation counter
+            Text(
+              'Trans: $_translatedCount  Skip: $_skippedCount',
+              style: const TextStyle(color: Colors.white38, fontSize: 11),
+            ),
+            const Spacer(),
+            // Clear button
+            GestureDetector(
+              onTap: () async {
+                await _ch.invokeMethod('clearLogs');
+                if (mounted) setState(() { _logLines.clear(); _skippedCount = 0; _translatedCount = 0; });
+              },
+              child: const Icon(Icons.delete_outline, color: Colors.white38, size: 18),
+            ),
+          ]),
+        ),
+        // Log lines
+        Expanded(
+          child: _logLines.isEmpty
+              ? const Center(child: Text('No logs yet — start Caption Lens',
+                  style: TextStyle(color: Colors.white24)))
+              : ListView.builder(
+                  controller: _logScroll,
+                  padding: const EdgeInsets.fromLTRB(8, 4, 8, 8),
+                  itemCount: _logLines.length,
+                  itemBuilder: (_, i) {
+                    final line = _logLines[i];
+                    Color c = Colors.white54;
+                    if (line.contains('Gender') || line.contains('YIN')) {
+                      c = _genderDetected == 'female' ? femaleColor : maleColor;
+                    } else if (line.contains('SKIP')) {
+                      c = Colors.orange.withOpacity(0.7);
+                    } else if (line.contains('ENQ') || line.contains('OK ')) {
+                      c = Colors.greenAccent.withOpacity(0.8);
+                    } else if (line.contains('ERR') || line.contains('error')) {
+                      c = Colors.redAccent.withOpacity(0.8);
+                    } else if (line.contains('female') || line.contains('FEMALE')) {
+                      c = femaleColor.withOpacity(0.9);
+                    } else if (line.contains('male') || line.contains('MALE')) {
+                      c = maleColor.withOpacity(0.7);
+                    }
+                    return Text(
+                      line,
+                      style: TextStyle(
+                        color: c, fontSize: 10,
+                        fontFamily: 'monospace',
+                        height: 1.4,
+                      ),
+                    );
+                  },
+                ),
+        ),
+      ],
     );
   }
 
