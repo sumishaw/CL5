@@ -42,7 +42,8 @@ object GenderAnalyzer {
     private const val RMS_FLOOR     = 8f     // 8/128 = ~6% of max — skip near-silence
     private const val HIST          = 3      // 2/3 majority to switch
 
-    @Volatile var enabled  = false
+    @Volatile var enabled     = false
+    @Volatile var lastStatus  = "never started"   // shown in Log tab status bar
 
     private var visualizer: Visualizer? = null
     private var sampleRate = 44100       // updated from Visualizer at start
@@ -66,6 +67,7 @@ object GenderAnalyzer {
      */
     fun start(projection: MediaProjection? = null) {
         stop()
+        lastStatus = "starting…"
         CaptionLogger.log(TAG, "start() called — attempting Visualizer(0) global audio mix")
         try {
             // Session 0 = global audio output mix
@@ -95,9 +97,11 @@ object GenderAnalyzer {
             frameCount = 0; analyzeCount = 0; captureCount = 0
             history.clear()
 
+            lastStatus = "OK SR=${sampleRate}Hz"
             CaptionLogger.log(TAG, ">>> STARTED Visualizer SR=${sampleRate}Hz enabled=$enabled <<<")
         } catch (e: Exception) {
             enabled = false
+            lastStatus = "FAILED: ${e.message}"
             CaptionLogger.log(TAG, "Visualizer start FAILED: ${e.message}")
             Log.e(TAG, "Visualizer start failed", e)
         }
@@ -202,8 +206,10 @@ object GenderAnalyzer {
         val gender = if (f0 >= F0_MALE_MAX) HindiTtsService.Gender.FEMALE
                      else                    HindiTtsService.Gender.MALE
 
-        if (frameCount % 3 == 0)
+        if (frameCount % 3 == 0) {
+            lastStatus = "active caps=$captureCount F0=${f0.toInt()}Hz"
             CaptionLogger.log(TAG, "PITCH F0=${f0.toInt()}Hz rms=${rms.toInt()} → $gender cur=${HindiTtsService.detectedGender}")
+        }
 
         history.addLast(gender)
         if (history.size > HIST) history.removeFirst()
