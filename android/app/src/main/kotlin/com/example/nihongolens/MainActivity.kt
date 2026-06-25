@@ -196,7 +196,8 @@ class MainActivity : FlutterActivity() {
                             else                          -> "auto"
                         },
                         "enabled"   to GenderAnalyzer.enabled,
-                        "speaking"  to HindiTtsService.isSpeaking
+                        "speaking"  to HindiTtsService.isSpeaking,
+                        "status"    to GenderAnalyzer.lastStatus
                     ))
                 }
 
@@ -218,6 +219,10 @@ class MainActivity : FlutterActivity() {
         instance = this
         if (!SpeechCaptureService.isRunning) {
             checkAndNotifyWhisperReady()
+        }
+        // Restart GenderAnalyzer if it stopped (e.g. app was backgrounded)
+        if (!GenderAnalyzer.enabled) {
+            GenderAnalyzer.start()
         }
     }
 
