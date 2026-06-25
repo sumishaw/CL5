@@ -34,7 +34,7 @@ class LiveCaptionReader : AccessibilityService() {
         private const val WATCHDOG_MS      = 2_000L
         private const val STARTUP_GRACE_MS = 1_000L
         private const val LANG_CONFIRM     = 3
-        private const val QUEUE_CAP        = 2   // keep queue short — drop old when whisper is slow
+        private const val QUEUE_CAP        = 8   // enough to buffer ~10s of speech at normal pace
 
         private val LC_PACKAGES = setOf(
             "com.google.android.as",
@@ -52,7 +52,8 @@ class LiveCaptionReader : AccessibilityService() {
     private var watchdogJob:  Job? = null
 
     // FIFO + tokens
-    private val queue      = LinkedBlockingQueue<Pair<Long, String>>()
+    private data class QItem(val seq: Long, val text: String, val enqMs: Long = System.currentTimeMillis())
+    private val queue      = LinkedBlockingQueue<QItem>()
     private val seqCounter = AtomicLong(0)
     @Volatile private var expectedSeq = 0L
 
@@ -256,8 +257,13 @@ class LiveCaptionReader : AccessibilityService() {
         if (n == lastEnqueued) return
         lastEnqueued = n
         val seq = seqCounter.incrementAndGet()
-        if (queue.size >= QUEUE_CAP) queue.poll()
-        queue.offer(Pair(seq, text))
+        // Simple path — same smart drop logic
+        if (queue.size >= QUEUE_CAP) {
+            val oldest = queue.peek()
+            val age = if (oldest != null) System.currentTimeMillis() - oldest.enqMs else 9999L
+            if (age > 8_000L) queue.poll()
+        }
+        queue.offer(QItem(seq, text))
         enqCount.incrementAndGet()
         CaptionLogger.log(TAG, "ENQ-S seq=$seq q=${queue.size} '${text.take(60)}'")
     }
@@ -416,11 +422,18 @@ class LiveCaptionReader : AccessibilityService() {
         val seq = seqCounter.incrementAndGet()
 
         if (queue.size >= QUEUE_CAP) {
-            queue.poll()
-            CaptionLogger.log(TAG, "CAP: dropped oldest")
+            // Only drop if the oldest item is >8s old (truly stale)
+            // Don't drop recent sentences — they still need to be spoken
+            val oldest = queue.peek()
+            val oldestAge = if (oldest != null) System.currentTimeMillis() - oldest.enqMs else 0L
+            if (oldestAge > 8_000L) {
+                queue.poll()
+                CaptionLogger.log(TAG, "CAP: dropped stale item age=${oldestAge/1000}s")
+            }
+            // If oldest is recent, keep it — let queue grow slightly
         }
 
-        queue.offer(Pair(seq, text))
+        queue.offer(QItem(seq, text))
         enqCount.incrementAndGet()
         CaptionLogger.log(TAG, "ENQ seq=$seq q=${queue.size} '${text.take(60)}'")
     }
@@ -435,8 +448,16 @@ class LiveCaptionReader : AccessibilityService() {
                     catch (_: InterruptedException) { null }
                 } ?: continue
 
-                val (seq, text) = item
+                val seq  = item.seq
+                val text = item.text
+                val ageMs = System.currentTimeMillis() - item.enqMs
+
                 if (seq < expectedSeq) { CaptionLogger.log(TAG, "STALE $seq"); continue }
+                // Drop sentences that waited too long — speaker has moved on
+                if (ageMs > 15_000L) {
+                    CaptionLogger.log(TAG, "EXPIRED $seq age=${ageMs/1000}s")
+                    continue
+                }
 
                 val t0     = System.currentTimeMillis()
                 lastSentText = text
